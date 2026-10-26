@@ -1,0 +1,5 @@
+<resources>
+    <color name="pitch">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="dialog">#FF101010</color>
+</resources>

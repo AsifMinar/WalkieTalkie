@@ -1,0 +1,8 @@
+# Signing secrets: never commit. Back these up somewhere safe.
+*.jks
+*.keystore
+signing.env
+
+# Build output
+build/
+*.idsig
