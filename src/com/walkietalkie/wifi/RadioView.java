@@ -1,8 +1,6 @@
 package com.walkietalkie.wifi;
 
 import android.animation.ValueAnimator;
-import android.graphics.Bitmap;
-import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
@@ -19,38 +17,64 @@ import android.text.TextPaint;
 import android.text.TextUtils;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
+import android.view.VelocityTracker;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.animation.DecelerateInterpolator;
 import android.view.animation.OvershootInterpolator;
+import android.widget.OverScroller;
 
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Random;
 
 /**
  * The entire radio, drawn on one canvas: no view tree, no images, no libraries. It only redraws
- * when something changes, and runs a ~30 fps loop only while someone is talking.
+ * when something changes, and runs a ~30 fps loop only while someone is talking (60 fps while the
+ * talk button's water ripples are moving).
+ *
+ * The look is pitch black: every surface is black, parts are separated by thin grey lines that
+ * stay visible at the lowest screen brightness, and white is kept for what you read or press
+ * (text, digits, the talk button, switched-on toggles).
  */
 final class RadioView extends View {
 
-    private static final int R_NONE = 0, R_POWER = 1, R_CH_DOWN = 3, R_CH_UP = 4,
+    private static final int R_NONE = 0, R_POWER = 1, R_NAME = 2, R_CH_DOWN = 3, R_CH_UP = 4,
             R_SOUNDS = 6, R_BG = 7, R_KNOB = 8, R_STRIP = 9;
 
     private static final int WHITE = 0xFFFFFFFF, BLACK = 0xFF000000;
+    // Pitch-black palette: surfaces stay black, these greys only draw edges, dots and states.
+    // High contrast on purpose: phone screens at low brightness swallow dark greys, so anything
+    // darker than about #555 vanished in a dark room. These stay visible at the lowest brightness.
+    private static final int LINE = 0xFF707070;         // outline of every button, chip and panel
+    private static final int LINE_DIM = 0xFF606060;     // speaker grille outline (one step quieter)
+    private static final int PRESSED = 0xFF303030;      // fill while a finger is on something
+    private static final int AVATAR = 0xFF141414;       // the circle behind a person's initial
+    private static final int AVATAR_ON_WHITE = 0xFFE4E4E4;   // ...on the white private-call chip
+    private static final int SUB_ON_WHITE = 0xFF444444;      // "Private call" on the white chip
+    private static final int GREY_TEXT = 0xFFB0B0B0;    // labels, sub-lines and the hint
+    private static final int UNLIT = 0xFF2C2C2C;        // channel digit segments that are off
+    private static final int METER_OFF = 0xFF555555;    // level meter bars that are off
+    private static final int TRACK_TOP = 0xFF333333, TRACK_BOTTOM = 0xFF0D0D0D, TRACK_EDGE = 0xFF6A6A6A;
+    private static final int TRACK_EDGE_LIVE = 0xFFA0A0A0;   // track outline while talking to everyone
+
+    // Water ripples around the talk button: a small fixed pool, so frames never allocate.
+    private static final int MAX_WAVES = 12;
 
     // Seven-segment patterns, bit 0..6 = segments a..g
     private static final int[] DIGITS = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
-    private static final int[] DOT_ALPHA = {34, 95, 155, 215, 255};
+    private static final int[] DOT_ALPHA = {102, 140, 180, 220, 255};   // [0] = unlit grille dot (#666)
 
     private final MainActivity host;
     private final RadioEngine engine;
     private final float dp, ts;
     private final Geometry g = new Geometry();
+    // 1 on normal screens. In a window smaller than Geometry.MIN_W_DP x MIN_H_DP (split screen,
+    // pop-up window) the radio is laid out at that minimum size and drawn scaled down by this much;
+    // touches are scaled back, so every button answers exactly where it is drawn.
+    private float fit = 1f;
 
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint glow = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint grain = new Paint();
     private final Paint dots = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final TextPaint text = new TextPaint(Paint.ANTI_ALIAS_FLAG);
     private final TextPaint subText = new TextPaint(Paint.ANTI_ALIAS_FLAG);
@@ -62,7 +86,8 @@ final class RadioView extends View {
     private final Path[][] seg = new Path[2][7];
     private final Matrix matrix = new Matrix();
 
-    private Shader bodyFill, bodyEdge, ambientA, ambientB, lcdSheen, knobShade, txGlow, rxGlow;
+    private Shader trackFill, knobShade, rxGlow;
+    private final Path bodyClip = new Path();   // ripples stay inside the radio's body
     private final Paint.FontMetrics fm = new Paint.FontMetrics();
     private float[] dotPts = new float[0];
     private int[] dotCol = new int[0];          // columns away from the centre column
@@ -83,7 +108,11 @@ final class RadioView extends View {
     private String callsign = "", title = "", netLine = "", hintDirect = "";
     private String sub = "";
 
-    // people row: chip 0 is you, then everyone else on this Wi-Fi
+    // your name plate between the channel buttons (tap it to change your name)
+    private float plateL, plateR;
+    private String plateName = "", plateInitial = "?";
+
+    // people row: everyone else on this Wi-Fi (you are on the name plate, not in this row)
     private ArrayList<PeerTable.Peer> people = new ArrayList<>();
     private int chipCount;
     private int[] chipId = new int[0];
@@ -92,10 +121,16 @@ final class RadioView extends View {
     private String emptyText = "";
     private float stripScroll, stripMax, stripDownX, stripDownScroll;
     private boolean stripScrolling;
-    // Which chip is pressed, by position: -1 none, 0 you, 1+ a person. Never inferred from the id,
+    // Which chip is pressed, by position: -1 none, 0+ a person. Never inferred from the id,
     // because ids are random 32-bit numbers and half of them are negative.
     private int pressedChip = -1;
-    private int pressedPeer;                    // that person's id (valid when pressedChip >= 1)
+    private int pressedPeer;                    // that person's id (valid when pressedChip >= 0)
+    private ValueAnimator stripAnim;            // scrolls a private call's chip fully into view
+    private float stripAnimTo;
+    // A swipe that ends fast keeps the row gliding and slowing down, like any phone list.
+    private final OverScroller glide;
+    private VelocityTracker swipe;              // only while a finger is on the row
+    private final float minGlide, maxGlide;     // px per second, from the system's touch settings
     private int directTo;                       // person we're talking to privately (0 = none)
     private boolean directStarted;              // a private call began during the current touch
     private int speaker;                        // who is talking to us (0 = nobody)
@@ -106,9 +141,23 @@ final class RadioView extends View {
 
     // knob + touch
     private float knobOffset, downY, downOffset, shakeX, level;
+    private long levelAt;                       // the level meter steps at ~30 fps, whatever the frame rate
     private boolean dragging, armed, locked;
     private int pressed = R_NONE;
-    private ValueAnimator knobAnim, shakeAnim;
+    private ValueAnimator knobAnim, shakeAnim, dipAnim;
+
+    // water drop: the knob dips when pressed, rings spread from it while you talk to everyone
+    private float knobScale = 1f;
+    private boolean slid;                       // this press started sliding up: no more waves
+    private final long[] waveAt = new long[MAX_WAVES];
+    private final int[] waveDur = new int[MAX_WAVES];      // 0 = free slot
+    private final float[] waveAlpha = new float[MAX_WAVES], waveWidth = new float[MAX_WAVES],
+            waveReach = new float[MAX_WAVES];
+    private long nextWaveAt;
+    // Set when the screen goes away while you hold or lock the talk button. Leaving stops talking
+    // (the mic never stays open off screen), and the knob resets when you come back: that reset is
+    // not something you did, so it shouldn't send a wave.
+    private boolean awayWhileTalking;
 
     RadioView(MainActivity host, RadioEngine engine) {
         super(host);
@@ -128,19 +177,10 @@ final class RadioView extends View {
         subText.setColor(0x9EFFFFFF);
         subText.setTypeface(regular);
 
-        // Fine frosted grain: a 96x96 alpha-only tile (9 KB) repeated over the glass.
-        int n = 96;
-        byte[] px = new byte[n * n];
-        Random r = new Random(7);
-        for (int i = 0; i < px.length; i++) px[i] = (byte) r.nextInt(16);
-        Bitmap noise = Bitmap.createBitmap(n, n, Bitmap.Config.ALPHA_8);
-        noise.copyPixelsFromBuffer(ByteBuffer.wrap(px));
-        BitmapShader bs = new BitmapShader(noise, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT);
-        Matrix gm = new Matrix();
-        gm.setScale(0.75f * dp, 0.75f * dp);
-        bs.setLocalMatrix(gm);
-        grain.setShader(bs);
-        grain.setColor(WHITE);
+        glide = new OverScroller(host);
+        ViewConfiguration vc = ViewConfiguration.get(host);
+        minGlide = vc.getScaledMinimumFlingVelocity();
+        maxGlide = vc.getScaledMaximumFlingVelocity();
 
         setContentDescription("Walkie Talkie");
         setFilterTouchesWhenObscured(true);       // ignore taps passed through another app's overlay
@@ -201,13 +241,18 @@ final class RadioView extends View {
         hintDirect = directTo != 0 ? "Talking to " + engine.nameOf(directTo) + " only" : "";
         people = engine.peers();
         layoutChips();
+        if (directTo != 0) revealChip(directTo);     // the list may have re-sorted mid-call
 
         if (!txOn && (locked || dragging)) {         // transmission ended on its own
+            boolean pressing = dragging && !slid;    // a wave only for a press held in place
             locked = false;
             dragging = false;
             armed = false;
             animateKnob(0);
+            dipKnob(false);
+            if (pressing && !awayWhileTalking) releaseWave();   // leaving the app: no wave on return
         }
+        if (!txOn) awayWhileTalking = false;
         setKeepScreenOn(txOn);
         buildSubLayout();
         invalidate();
@@ -232,19 +277,16 @@ final class RadioView extends View {
     // ------------------------------------------------------------------ layout
 
     @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
-        g.compute(w, h, dp, ts);
+        fit = Geometry.fitScale(w, h, dp);
+        g.compute(w / fit, h / fit, dp, ts);       // fit == 1: the real size, as before
         sized = true;
 
-        bodyFill = new LinearGradient(g.bodyL, g.bodyT, g.bodyR, g.bodyB, 0x1CFFFFFF, 0x08FFFFFF, Shader.TileMode.CLAMP);
-        bodyEdge = new LinearGradient(g.bodyL, g.bodyT, g.bodyL + (g.bodyR - g.bodyL) * 0.5f, g.bodyB,
-                0x70FFFFFF, 0x12FFFFFF, Shader.TileMode.CLAMP);
-        ambientA = new RadialGradient(g.bodyR - 20 * dp, g.lcdT, w * 0.8f, 0x1EFFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP);
-        ambientB = new RadialGradient(g.bodyL + 10 * dp, g.trB, w * 0.7f, 0x14FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP);
-        lcdSheen = new LinearGradient(0, g.lcdT, 0, g.lcdT + (g.lcdB - g.lcdT) * 0.55f, 0x16FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP);
+        // the slide track fades from dark grey at the top to black at the bottom
+        trackFill = new LinearGradient(0, g.trT, 0, g.trB, TRACK_TOP, TRACK_BOTTOM, Shader.TileMode.CLAMP);
         knobShade = new RadialGradient(-g.knobR * 0.35f, -g.knobR * 0.45f, g.knobR * 1.6f,
                 new int[]{0xFFFFFFFF, 0xFFF1F1F1, 0xFFC9C9C9}, new float[]{0f, 0.55f, 1f}, Shader.TileMode.CLAMP);
-        txGlow = new RadialGradient(0, 0, g.knobR * 2.6f,
-                new int[]{0x70FFFFFF, 0x22FFFFFF, 0x00FFFFFF}, new float[]{0f, 0.45f, 1f}, Shader.TileMode.CLAMP);
+        bodyClip.reset();
+        bodyClip.addRoundRect(g.bodyL, g.bodyT, g.bodyR, g.bodyB, g.bodyRad, g.bodyRad, Path.Direction.CW);
         rxGlow = new RadialGradient((g.grL + g.grR) / 2f, (g.grT + g.grB) / 2f,
                 Math.max(1f, (g.grR - g.grL) * 0.6f), 0x30FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP);
 
@@ -357,23 +399,21 @@ final class RadioView extends View {
     @Override protected void onDraw(Canvas c) {
         if (!sized) return;
         c.drawColor(BLACK);
+        int saved = c.save();
+        if (fit < 1f) c.scale(fit, fit);           // small window: the whole radio, evenly smaller
         long now = SystemClock.uptimeMillis();
         float pulse = (float) (0.5 + 0.5 * Math.sin(now / 260.0));
-        float target = !powered ? 0f : (txOn ? engine.txLevel : (rxOn ? engine.rxLevelNow() : 0f));
-        target = Math.min(1f, target * 1.15f);
-        // fast rise, gentle fall: reads like a VU meter
-        level = target > level ? level + (target - level) * 0.6f : level * 0.8f + target * 0.2f;
-        if (level < 0.005f) level = 0;
+        // Fast rise, gentle fall: reads like a VU meter. Stepped every ~33 ms so the meter feels the
+        // same at 30 fps and while the ripples run at the screen's full frame rate.
+        if (now - levelAt >= 30 || now < levelAt) {
+            levelAt = now;
+            float target = !powered ? 0f : (txOn ? engine.txLevel : (rxOn ? engine.rxLevelNow() : 0f));
+            target = Math.min(1f, target * 1.15f);
+            level = target > level ? level + (target - level) * 0.6f : level * 0.8f + target * 0.2f;
+            if (level < 0.005f) level = 0;
+        }
         stepHistory(now, level);
         boolean live = powered && hasNet;
-
-        // ambient light behind the glass
-        glow.setShader(ambientA);
-        glow.setAlpha(255);
-        c.drawCircle(g.bodyR - 20 * dp, g.lcdT, g.w * 0.8f, glow);
-        glow.setShader(ambientB);
-        c.drawCircle(g.bodyL + 10 * dp, g.trB, g.w * 0.7f, glow);
-        glow.setShader(null);
 
         drawBody(c);
         drawHeader(c);
@@ -381,24 +421,18 @@ final class RadioView extends View {
         drawDisplay(c, pulse);
         drawRow(c);
         drawStrip(c, pulse, live);
-        drawSlider(c, pulse, live);
+        drawSlider(c, live);
+        boolean waves = drawWaves(c, now);
+        c.restoreToCount(saved);
 
-        if (txOn || rxOn || level > 0 || histPeak > 0) postInvalidateDelayed(33);
+        if (waves) postInvalidateOnAnimation();             // smooth ripples, only while they move
+        else if (txOn || rxOn || level > 0 || histPeak > 0) postInvalidateDelayed(33);
     }
 
+    /** The body is black on black, so only its outline shows. */
     private void drawBody(Canvas c) {
         float r = g.bodyRad;
-        fill.setColor(WHITE);                     // shaders are multiplied by the paint's alpha
-        fill.setShader(bodyFill);
-        c.drawRoundRect(g.bodyL, g.bodyT, g.bodyR, g.bodyB, r, r, fill);
-        fill.setShader(null);
-        c.drawRoundRect(g.bodyL, g.bodyT, g.bodyR, g.bodyB, r, r, grain);
-        line.setColor(WHITE);
-        line.setShader(bodyEdge);
-        line.setStrokeWidth(1.2f * dp);
-        float i = 0.6f * dp;
-        c.drawRoundRect(g.bodyL + i, g.bodyT + i, g.bodyR - i, g.bodyB - i, r, r, line);
-        line.setShader(null);
+        outline(c, g.bodyL, g.bodyT, g.bodyR, g.bodyB, r, LINE);
     }
 
     /** The radio's printed name on the left and the power button on the right, inside the body. */
@@ -413,16 +447,16 @@ final class RadioView extends View {
 
         boolean down = pressed == R_POWER;
         float cx = g.pwrCx, cy = g.hdrCy, r = g.pwrR;
-        fill.setColor(down ? 0x40FFFFFF : (powered ? 0x1FFFFFFF : 0x0DFFFFFF));
+        fill.setColor(down ? PRESSED : BLACK);
         c.drawCircle(cx, cy, r, fill);
         line.setStrokeWidth(dp);
-        line.setColor(powered ? 0x5CFFFFFF : 0x2EFFFFFF);
+        line.setColor(powered ? LINE : LINE_DIM);
         c.drawCircle(cx, cy, r - dp / 2, line);
         powerIcon(c, cx, cy + 0.5f * dp, r * 0.95f, powered ? WHITE : 0x73FFFFFF);
     }
 
     private void drawGrille(Canvas c, long now) {
-        glass(c, g.grL, g.grT, g.grR, g.grB, g.grRad, 0x0D, 0x1F, false);
+        outline(c, g.grL, g.grT, g.grR, g.grB, g.grRad, LINE_DIM);
         boolean active = powered && histPeak > 0;
         if (active) {                                            // soft white bloom behind loud speech
             glow.setShader(rxGlow);
@@ -459,29 +493,19 @@ final class RadioView extends View {
         dots.setStrokeWidth(3.4f * dp);
         for (int k = 0; k < bucketLen.length; k++) {
             if (bucketLen[k] == 0) continue;
-            int a = k == 0 ? (powered ? DOT_ALPHA[0] : 20) : DOT_ALPHA[k];
+            int a = k == 0 ? (powered ? DOT_ALPHA[0] : 60) : DOT_ALPHA[k];
             dots.setColor(Color.argb(a, 255, 255, 255));
             c.drawPoints(buckets[k], 0, bucketLen[k], dots);
         }
     }
 
     private void drawDisplay(Canvas c, float pulse) {
-        float r = g.lcdRad;
-        boolean down = false;
-        fill.setColor(0xDB000000);
-        c.drawRoundRect(g.lcdL, g.lcdT, g.lcdR, g.lcdB, r, r, fill);
-        fill.setColor(WHITE);
-        fill.setShader(lcdSheen);
-        c.drawRoundRect(g.lcdL, g.lcdT, g.lcdR, g.lcdB, r, r, fill);
-        fill.setShader(null);
-        line.setStrokeWidth(dp);
-        line.setColor(down ? 0x4DFFFFFF : 0x24FFFFFF);
-        c.drawRoundRect(g.lcdL + dp / 2, g.lcdT + dp / 2, g.lcdR - dp / 2, g.lcdB - dp / 2, r, r, line);
+        outline(c, g.lcdL, g.lcdT, g.lcdR, g.lcdB, g.lcdRad, LINE);
 
         // label
         text.setTypeface(regular);
         text.setTextSize(g.labelSize);
-        text.setColor(powered ? 0x80FFFFFF : 0x4DFFFFFF);
+        text.setColor(powered ? GREY_TEXT : 0x66FFFFFF);
         c.drawText("Channel", g.digitL, g.labelBaseline, text);
 
         // seven-segment channel number
@@ -490,7 +514,7 @@ final class RadioView extends View {
             m0 = DIGITS[channel / 10];
             m1 = DIGITS[channel % 10];
         }
-        fill.setColor(0x14FFFFFF);
+        fill.setColor(UNLIT);
         for (int d = 0; d < 2; d++) for (int s = 0; s < 7; s++) c.drawPath(seg[d][s], fill);
         if (powered) {
             fill.setColor(WHITE);
@@ -532,7 +556,7 @@ final class RadioView extends View {
         float mx = g.lcdR - g.lcdPad - total;
         text.setTypeface(regular);
         text.setTextSize(g.footSize);
-        text.setColor(0x73FFFFFF);
+        text.setColor(GREY_TEXT);
         if (!netLine.isEmpty()) {
             c.drawText(ellipsize(netLine, mx - 10 * dp - (g.lcdL + g.lcdPad)), g.lcdL + g.lcdPad, g.footBaseline, text);
         }
@@ -541,7 +565,7 @@ final class RadioView extends View {
             for (int i = 0; i < 10; i++) {
                 float bh = 4 * dp + i * (10 * dp / 9f);
                 float x = mx + i * (barW + gap);
-                fill.setColor(i < lit ? WHITE : 0x24FFFFFF);
+                fill.setColor(i < lit ? WHITE : METER_OFF);
                 c.drawRoundRect(x, g.footBaseline - bh, x + barW, g.footBaseline, barW / 2, barW / 2, fill);
             }
         }
@@ -556,21 +580,68 @@ final class RadioView extends View {
         c.drawLine(g.chDownCx - a, g.rowCy, g.chDownCx + a, g.rowCy, line);
         c.drawLine(g.chUpCx - a, g.rowCy, g.chUpCx + a, g.rowCy, line);
         c.drawLine(g.chUpCx, g.rowCy - a, g.chUpCx, g.rowCy + a, line);
+        drawNamePlate(c);
+    }
 
-        // the stepper says what it does: these buttons change the channel
-        text.setTypeface(regular);
-        text.setTextSize(g.rowLabelSize);
-        text.setColor(powered ? 0xA6FFFFFF : 0x59FFFFFF);
+    /** Your initial, your name and a pencil, between the channel buttons. Tap it to rename. */
+    private void drawNamePlate(Canvas c) {
+        float t = g.nameT, b = g.nameB, r = (b - t) / 2f;
+        fill.setColor(pressed == R_NAME ? PRESSED : BLACK);
+        c.drawRoundRect(plateL, t, plateR, b, r, r, fill);
+        line.setStrokeWidth(dp);
+        line.setColor(LINE);
+        c.drawRoundRect(plateL + dp / 2, t + dp / 2, plateR - dp / 2, b - dp / 2, r, r, line);
+
+        float ax = plateL + 5 * dp + g.nameAvR;
+        fill.setColor(0xFF111111);
+        c.drawCircle(ax, g.rowCy, g.nameAvR, fill);
+        line.setColor(LINE);
+        c.drawCircle(ax, g.rowCy, g.nameAvR - dp / 2, line);
+        text.setTypeface(medium);
+        text.setTextSize(13 * dp);
+        text.setColor(WHITE);
         text.setTextAlign(Paint.Align.CENTER);
         text.getFontMetrics(fm);
-        c.drawText("Change channel", (g.bodyL + g.bodyR) / 2f, g.rowCy - (fm.ascent + fm.descent) / 2f, text);
+        c.drawText(plateInitial, ax, g.rowCy - (fm.ascent + fm.descent) / 2f, text);
         text.setTextAlign(Paint.Align.LEFT);
+
+        float tx = ax + g.nameAvR + 10 * dp;
+        float ix = plateR - 14 * dp - 7 * dp;                       // pencil centre
+        text.setTextSize(g.chipNameSize);
+        c.drawText(plateName, tx, g.rowCy - 2 * dp, text);
+        text.setTypeface(regular);
+        text.setTextSize(g.chipSubSize);
+        text.setColor(GREY_TEXT);
+        c.drawText(ellipsize("Your name", ix - 7 * dp - 10 * dp - tx), tx, g.rowCy + 12 * dp, text);
+        pencilIcon(c, ix, g.rowCy, 14 * dp, 0xFFC8C8C8);
+    }
+
+    /** Sizes the name plate to your name, centred between - and +, never wider than the gap. */
+    private void layoutName() {
+        if (!sized) return;
+        String name = callsign == null || callsign.isEmpty() ? "Someone" : callsign;
+        float maxW = Math.max(0, g.nameMaxR - g.nameMinL);
+        float fixed = 5 * dp + 2 * g.nameAvR + 10 * dp + 10 * dp + 14 * dp + 14 * dp;  // avatar, gaps, pencil
+        float room = Math.max(0, maxW - fixed);
+        text.setTypeface(regular);
+        text.setTextSize(g.chipSubSize);
+        float w = Math.min(text.measureText("Your name"), room);
+        text.setTypeface(medium);
+        text.setTextSize(g.chipNameSize);
+        plateName = ellipsize(name, room);
+        w = Math.max(w, text.measureText(plateName));
+        float total = Math.min(maxW, fixed + w);
+        float cx = (g.chDownCx + g.chUpCx) / 2f;
+        plateL = cx - total / 2f;
+        plateR = cx + total / 2f;
+        plateInitial = new String(Character.toChars(Character.toUpperCase(name.codePointAt(0))));
     }
 
     /** Measures every chip once per change, so drawing a frame never measures text. */
     private void layoutChips() {
         if (!sized) return;
-        int n = people.size() + 1;
+        layoutName();
+        int n = people.size();
         if (chipId.length < n) {
             int cap = n + 4;
             chipId = new int[cap];
@@ -583,9 +654,9 @@ final class RadioView extends View {
         chipCount = n;
         float maxText = 120 * dp, x = 0, gap = 8 * dp;
         for (int i = 0; i < n; i++) {
-            PeerTable.Peer p = i == 0 ? null : people.get(i - 1);
-            String name = i == 0 ? callsign : p.name;
-            String subLine = i == 0 ? "You" : (p.channel == channel ? "Hold to talk" : "On channel " + p.channel);
+            PeerTable.Peer p = people.get(i);
+            String name = p.name;
+            String subLine = p.channel == channel ? "Hold to talk" : "On channel " + p.channel;
             text.setTypeface(medium);
             text.setTextSize(g.chipNameSize);
             String fitted = ellipsize(name, maxText);
@@ -593,7 +664,7 @@ final class RadioView extends View {
             text.setTypeface(regular);
             text.setTextSize(g.chipSubSize);
             w = Math.max(w, text.measureText(subLine));
-            chipId[i] = i == 0 ? 0 : p.id;
+            chipId[i] = p.id;
             chipName[i] = fitted;
             chipSub[i] = subLine;
             int cp = name.isEmpty() ? '?' : name.codePointAt(0);
@@ -607,8 +678,7 @@ final class RadioView extends View {
         if (stripScroll > stripMax) stripScroll = stripMax;
         text.setTypeface(regular);
         text.setTextSize(g.chipSubSize * 1.1f);
-        emptyText = people.isEmpty()
-                ? ellipsize("Others on this Wi-Fi show up here", width - chipW[0] - 14 * dp) : "";
+        emptyText = people.isEmpty() ? ellipsize("Others on this Wi-Fi show up here", width - 12 * dp) : "";
     }
 
     private void drawStrip(Canvas c, float pulse, boolean live) {
@@ -619,39 +689,29 @@ final class RadioView extends View {
             float l = g.stripL + chipX[i] - stripScroll, rr = l + chipW[i];
             if (rr < g.stripL || l > g.stripR) continue;
             int id = chipId[i];
-            boolean me = i == 0;
-            boolean talkingTo = !me && txOn && id == directTo;
-            boolean hearing = !me && id == speaker;
-            boolean down = !stripScrolling && (me ? pressedChip == 0 : pressedChip >= 1 && id == pressedPeer);
-            boolean usable = me || (live && (!txOn || talkingTo));
+            boolean talkingTo = txOn && id == directTo;
+            boolean hearing = id == speaker;
+            boolean down = !stripScrolling && pressedChip >= 0 && id == pressedPeer;
+            boolean usable = live && (!txOn || talkingTo);
             int ink;
-            if (talkingTo) {                                     // solid white while you talk to them
-                glow.setShader(null);
-                glow.setColor(Color.argb((int) (60 + 50 * pulse), 255, 255, 255));
-                glow.setMaskFilter(null);
-                c.drawRoundRect(l - 3 * dp, top - 3 * dp, rr + 3 * dp, bottom + 3 * dp, r + 3 * dp, r + 3 * dp, glow);
-                glow.setColor(WHITE);
+            if (talkingTo) {
+                // Private call: the whole chip turns solid white with black ink. Nothing is drawn
+                // outside the chip's own edge (the old outer glow got cut flat by the row's edges).
                 fill.setColor(WHITE);
                 c.drawRoundRect(l, top, rr, bottom, r, r, fill);
                 ink = BLACK;
             } else {
-                fill.setColor(down ? 0x3DFFFFFF : (me ? 0x0AFFFFFF : 0x17FFFFFF));
+                fill.setColor(down ? PRESSED : BLACK);
                 c.drawRoundRect(l, top, rr, bottom, r, r, fill);
                 line.setStrokeWidth(hearing ? 1.6f * dp : dp);
-                line.setColor(hearing ? Color.argb((int) (120 + 135 * pulse), 255, 255, 255) : (me ? 0x2EFFFFFF : 0x40FFFFFF));
+                line.setColor(hearing ? Color.argb((int) (120 + 135 * pulse), 255, 255, 255) : LINE);
                 c.drawRoundRect(l + dp / 2, top + dp / 2, rr - dp / 2, bottom - dp / 2, r, r, line);
                 ink = usable ? WHITE : 0x66FFFFFF;
             }
             // avatar with initial
             float ax = l + 6 * dp + 15 * dp;
-            if (talkingTo) fill.setColor(0x1F000000);
-            else fill.setColor(me ? 0x0FFFFFFF : 0x24FFFFFF);
+            fill.setColor(talkingTo ? AVATAR_ON_WHITE : AVATAR);
             c.drawCircle(ax, g.stripCy, 15 * dp, fill);
-            if (me) {
-                line.setStrokeWidth(dp);
-                line.setColor(0x4DFFFFFF);
-                c.drawCircle(ax, g.stripCy, 15 * dp - dp / 2, line);
-            }
             text.setTypeface(medium);
             text.setTextSize(13 * dp);
             text.setColor(ink);
@@ -665,20 +725,21 @@ final class RadioView extends View {
             c.drawText(chipName[i], tx, g.stripCy - 2 * dp, text);
             text.setTypeface(regular);
             text.setTextSize(g.chipSubSize);
-            text.setColor(talkingTo ? 0xB3000000 : (usable ? 0x99FFFFFF : 0x4DFFFFFF));
-            c.drawText(talkingTo ? "Only they hear you" : chipSub[i], tx, g.stripCy + 12 * dp, text);
-            // the voice button icon: mic for people, pencil for you
+            text.setColor(talkingTo ? SUB_ON_WHITE : (usable ? GREY_TEXT : 0x4DFFFFFF));
+            // "Private call" fits the narrowest chip; fitted anyway, since phones can use wider fonts
+            String line2 = talkingTo ? ellipsize("Private call", chipW[i] - 86 * dp) : chipSub[i];
+            c.drawText(line2, tx, g.stripCy + 12 * dp, text);
             float ix = rr - 12 * dp - 8 * dp;
-            if (me) pencilIcon(c, ix, g.stripCy, 14 * dp, 0x80FFFFFF);
-            else micIcon(c, ix, g.stripCy, 17 * dp, talkingTo ? BLACK : (usable ? 0xD9FFFFFF : 0x59FFFFFF));
+            micIcon(c, ix, g.stripCy, 17 * dp, talkingTo ? BLACK : (usable ? 0xD9FFFFFF : 0x59FFFFFF));
         }
         if (!emptyText.isEmpty()) {
             text.setTypeface(regular);
             text.setTextSize(g.chipSubSize * 1.1f);
-            text.setColor(powered ? 0x66FFFFFF : 0x33FFFFFF);
+            text.setColor(powered ? 0x99FFFFFF : 0x55FFFFFF);
+            text.setTextAlign(Paint.Align.CENTER);
             text.getFontMetrics(fm);
-            float x = g.stripL + chipX[0] + chipW[0] + 14 * dp - stripScroll;
-            c.drawText(emptyText, x, g.stripCy - (fm.ascent + fm.descent) / 2f, text);
+            c.drawText(emptyText, (g.stripL + g.stripR) / 2f, g.stripCy - (fm.ascent + fm.descent) / 2f, text);
+            text.setTextAlign(Paint.Align.LEFT);
         }
         c.restore();
     }
@@ -690,17 +751,18 @@ final class RadioView extends View {
     }
 
     private String chipNameOf(int id) {
-        for (int i = 1; i < chipCount; i++) if (chipId[i] == id) return chipName[i];
+        for (int i = 0; i < chipCount; i++) if (chipId[i] == id) return chipName[i];
         return "them";
     }
 
     /** Holding a person's chip for 90 ms starts a private call (shorter touches can scroll). */
     private void startDirect() {
-        if (pressedChip < 1 || stripScrolling || engine.transmitting) return;
+        if (pressedChip < 0 || stripScrolling || engine.transmitting) return;
         int id = pressedPeer;
         if (host.beginTalk(id)) {
             directTo = id;
             directStarted = true;
+            revealChip(id);
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
         } else {
             performHapticFeedback(HapticFeedbackConstants.REJECT);
@@ -708,19 +770,67 @@ final class RadioView extends View {
         invalidate();
     }
 
-    private void drawSlider(Canvas c, float pulse, boolean live) {
+    /**
+     * Scrolls the row so this person's chip is fully visible. Used for private calls, where a chip
+     * half off the edge used to hide "Private call". The finger can stay put: a private call
+     * follows the person, not the finger's position.
+     */
+    private void revealChip(int id) {
+        float width = g.stripR - g.stripL, inset = 2 * dp;
+        for (int i = 0; i < chipCount; i++) {
+            if (chipId[i] != id) continue;
+            float l = chipX[i], r = l + chipW[i], to = stripScroll;
+            if (l - inset < stripScroll) to = l - inset;
+            else if (r + inset > stripScroll + width) to = r + inset - width;
+            to = Math.max(0, Math.min(stripMax, to));
+            if (Math.abs(to - stripScroll) < 0.5f) return;
+            if (stripAnim != null && stripAnim.isRunning() && stripAnimTo == to) return;
+            glide.forceFinished(true);
+            cancelStripAnim();
+            ValueAnimator a = ValueAnimator.ofFloat(stripScroll, to);
+            a.setDuration(220);
+            a.setInterpolator(new DecelerateInterpolator());
+            a.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+                @Override public void onAnimationUpdate(ValueAnimator v) {
+                    stripScroll = Math.max(0, Math.min(stripMax, (Float) v.getAnimatedValue()));
+                    invalidate();
+                }
+            });
+            stripAnim = a;
+            stripAnimTo = to;
+            a.start();
+            return;
+        }
+    }
+
+    /** Advances a glide by one frame (Android calls this as part of every draw). */
+    @Override public void computeScroll() {
+        if (glide.computeScrollOffset()) {
+            stripScroll = Math.max(0, Math.min(stripMax, glide.getCurrX()));
+            postInvalidateOnAnimation();
+        }
+    }
+
+    private void cancelStripAnim() {
+        if (stripAnim != null) {
+            stripAnim.cancel();
+            stripAnim = null;
+        }
+    }
+
+    private void drawSlider(Canvas c, boolean live) {
         // side buttons
         toggle(c, g.soundsCx, soundsOn, pressed == R_SOUNDS, true, "Sounds");
         toggle(c, g.bgCx, bgOn, pressed == R_BG, false, "Always on");
 
-        // track
+        // track: fades from dark grey at the top to black at the bottom
         float tr = (g.trR - g.trL) / 2f;
-        fill.setColor(0x8C000000);
+        fill.setColor(WHITE);                     // shaders are multiplied by the paint's alpha
+        fill.setShader(trackFill);
         c.drawRoundRect(g.trL, g.trT, g.trR, g.trB, tr, tr, fill);
-        fill.setColor(0x0FFFFFFF);
-        c.drawRoundRect(g.trL, g.trT, g.trR, g.trB, tr, tr, fill);
+        fill.setShader(null);
         line.setStrokeWidth(dp);
-        line.setColor(0x33FFFFFF);
+        line.setColor(txOn && directTo == 0 ? TRACK_EDGE_LIVE : TRACK_EDGE);
         c.drawRoundRect(g.trL + dp / 2, g.trT + dp / 2, g.trR - dp / 2, g.trB - dp / 2, tr, tr, line);
 
         float travel = g.knobRestY - g.knobTopY;
@@ -729,14 +839,14 @@ final class RadioView extends View {
 
         // lit trail under the knob
         if (off > 1 || locked) {
-            fill.setColor(txOn ? 0x33FFFFFF : 0x1AFFFFFF);
+            fill.setColor(txOn ? 0x55FFFFFF : 0x33FFFFFF);
             float in = 7 * dp;
             c.drawRoundRect(g.trL + in, ky, g.trR - in, g.trB - in, g.knobR, g.knobR, fill);
         }
 
         // lock at the top of the track
         boolean lockLit = armed || locked;
-        lockIcon(c, g.knobCx, g.knobTopY, 22 * dp, lockLit ? WHITE : (live ? 0x66FFFFFF : 0x33FFFFFF));
+        lockIcon(c, g.knobCx, g.knobTopY, 22 * dp, lockLit ? WHITE : (live ? 0xAAFFFFFF : 0x55FFFFFF));
 
         // chevrons pointing up
         if (!dragging && !locked) {
@@ -746,41 +856,34 @@ final class RadioView extends View {
                 line.setStrokeWidth(2 * dp);
                 for (int i = 0; i < 3; i++) {
                     float cy = top + step * (i + 0.5f);
-                    int a = live ? (i == 0 ? 0x80 : (i == 1 ? 0x59 : 0x33)) : 0x1F;
+                    int a = live ? (i == 0 ? 0xC8 : (i == 1 ? 0x9A : 0x70)) : 0x50;
                     line.setColor(Color.argb(a, 255, 255, 255));
                     chevron(c, g.knobCx, cy, 14 * dp);
                 }
             }
         }
 
-        // the knob
-        if (txOn && directTo == 0) {                            // the big button glows only for "everyone"
-            matrix.setTranslate(kx, ky);
-            txGlow.setLocalMatrix(matrix);
-            glow.setShader(txGlow);
-            glow.setAlpha((int) (255 * (0.65f + 0.35f * pulse)));
-            c.drawCircle(kx, ky, g.knobR * 2.6f, glow);
-            glow.setShader(null);
-            glow.setAlpha(255);
-        }
+        // the knob (it dips a little while pressed: the water drop; talking shows as ripples)
+        float kr = g.knobR * knobScale;
         if (live) {
             matrix.setTranslate(kx, ky);
+            matrix.preScale(knobScale, knobScale);
             knobShade.setLocalMatrix(matrix);
             fill.setColor(WHITE);                 // was inheriting 40% from the lock icon: grey knob
             fill.setShader(knobShade);
-            c.drawCircle(kx, ky, g.knobR, fill);
+            c.drawCircle(kx, ky, kr, fill);
             fill.setShader(null);
-            micIcon(c, kx, ky, g.knobR * 0.95f, BLACK);
+            micIcon(c, kx, ky, kr * 0.95f, BLACK);
         } else {
-            fill.setColor(0x1FFFFFFF);
-            c.drawCircle(kx, ky, g.knobR, fill);
+            fill.setColor(0xFF111111);
+            c.drawCircle(kx, ky, kr, fill);
             line.setStrokeWidth(dp);
-            line.setColor(0x4DFFFFFF);
-            c.drawCircle(kx, ky, g.knobR - dp / 2, line);
-            micIcon(c, kx, ky, g.knobR * 0.95f, 0x80FFFFFF);
+            line.setColor(LINE);
+            c.drawCircle(kx, ky, kr - dp / 2, line);
+            micIcon(c, kx, ky, kr * 0.95f, 0x80FFFFFF);
         }
         if (locked) {
-            float bx = kx + g.knobR * 0.68f, by = ky - g.knobR * 0.68f, br = 12 * dp;
+            float bx = kx + kr * 0.68f, by = ky - kr * 0.68f, br = 12 * dp;
             fill.setColor(BLACK);
             c.drawCircle(bx, by, br, fill);
             line.setStrokeWidth(dp);
@@ -799,7 +902,7 @@ final class RadioView extends View {
         else hint = "Hold to talk to everyone, slide up to lock";
         text.setTypeface(regular);
         text.setTextSize(g.hintSize);
-        text.setColor(0x8CFFFFFF);
+        text.setColor(GREY_TEXT);
         text.setTextAlign(Paint.Align.CENTER);
         c.drawText(ellipsize(hint, g.bodyR - g.bodyL - 40 * dp), (g.bodyL + g.bodyR) / 2f, g.hintY, text);
         text.setTextAlign(Paint.Align.LEFT);
@@ -811,10 +914,10 @@ final class RadioView extends View {
             fill.setColor(down ? 0xFFD6D6D6 : WHITE);
             c.drawCircle(cx, cy, r, fill);
         } else {
-            fill.setColor(down ? 0x38FFFFFF : 0x17FFFFFF);
+            fill.setColor(down ? PRESSED : BLACK);
             c.drawCircle(cx, cy, r, fill);
             line.setStrokeWidth(dp);
-            line.setColor(0x47FFFFFF);
+            line.setColor(LINE);
             c.drawCircle(cx, cy, r - dp / 2, line);
         }
         int ic = on ? BLACK : 0xBFFFFFFF;
@@ -825,28 +928,139 @@ final class RadioView extends View {
         float room = 2 * Math.min(cx - (g.bodyL + 18 * dp), Math.abs(cx - g.knobCx) - (g.trR - g.trL) / 2f) - 6 * dp;
         float tw = text.measureText(label);
         if (tw > room && room > 0) text.setTextSize(g.sideLabelSize * room / tw);   // fit narrow screens
-        text.setColor(on ? 0xE6FFFFFF : 0x80FFFFFF);
+        text.setColor(on ? 0xE6FFFFFF : GREY_TEXT);
         text.setTextAlign(Paint.Align.CENTER);
         c.drawText(label, cx, g.sideLabelBaseline, text);
         text.setTextAlign(Paint.Align.LEFT);
     }
 
-    private void glass(Canvas c, float l, float t, float r, float b, float rad, int fillA, int edgeA, boolean grainy) {
-        fill.setColor(Color.argb(fillA, 255, 255, 255));
-        c.drawRoundRect(l, t, r, b, rad, rad, fill);
-        if (grainy) c.drawRoundRect(l, t, r, b, rad, rad, grain);
+    /** A black panel shows only as its thin outline (the background is already pitch black). */
+    private void outline(Canvas c, float l, float t, float r, float b, float rad, int color) {
         line.setStrokeWidth(dp);
-        line.setColor(Color.argb(edgeA, 255, 255, 255));
+        line.setColor(color);
         float i = dp / 2;
         c.drawRoundRect(l + i, t + i, r - i, b - i, rad, rad, line);
     }
 
     private void roundButton(Canvas c, float cx, float cy, float r, boolean down) {
-        fill.setColor(down ? 0x40FFFFFF : 0x14FFFFFF);
+        fill.setColor(down ? PRESSED : BLACK);
         c.drawCircle(cx, cy, r, fill);
         line.setStrokeWidth(dp);
-        line.setColor(0x38FFFFFF);
+        line.setColor(LINE);
         c.drawCircle(cx, cy, r - dp / 2, line);
+    }
+
+    // ------------------------------------------------------------------ water drop ripples
+
+    /** Honours "Remove animations" in the phone's accessibility settings. */
+    private static boolean motionOn() {
+        return ValueAnimator.areAnimatorsEnabled();
+    }
+
+    /**
+     * Queues one ring. {@code reach} is how far it travels, in knob radii; alpha and width fade as it
+     * spreads. When the pool is full the oldest ring makes room.
+     */
+    private void wave(long delay, float alpha, float widthDp, int dur, float reach) {
+        if (!sized || !motionOn()) return;
+        int slot = 0;
+        for (int i = 0; i < MAX_WAVES; i++) {
+            if (waveDur[i] == 0) {
+                slot = i;
+                break;
+            }
+            if (waveAt[i] < waveAt[slot]) slot = i;
+        }
+        waveAt[slot] = SystemClock.uptimeMillis() + delay;
+        waveDur[slot] = dur;
+        waveAlpha[slot] = alpha;
+        waveWidth[slot] = widthDp * dp;
+        waveReach[slot] = reach;
+        postInvalidateOnAnimation();
+    }
+
+    /** The drop lands: three rings, strongest first. */
+    private void splash() {
+        wave(0, 0.9f, 3f, 900, 3.3f);
+        wave(110, 0.55f, 2f, 1050, 2.9f);
+        wave(240, 0.3f, 1.5f, 1200, 2.6f);
+        nextWaveAt = SystemClock.uptimeMillis() + 600;
+    }
+
+    /** Letting go: one last soft ring. */
+    private void releaseWave() {
+        wave(0, 0.4f, 2f, 700, 2.1f);
+    }
+
+    private void clearWaves() {
+        for (int i = 0; i < MAX_WAVES; i++) waveDur[i] = 0;
+    }
+
+    /**
+     * Draws the rings around the knob and, while you hold the talk button in place, adds a new one
+     * now and then: louder speech sends them more often, brighter and further. Sliding up to lock
+     * stops new rings, and a locked transmission has none. Rings stay where the drop landed (the
+     * knob's resting place), so the ones already spreading don't follow the knob up the track.
+     * Returns true while anything moves.
+     */
+    private boolean drawWaves(Canvas c, long now) {
+        boolean emitting = dragging && !slid && engine.transmitting && directTo == 0 && motionOn();
+        if (emitting && now >= nextWaveAt) {
+            float lv = level;
+            wave(0, 0.18f + 0.32f * lv, 1.5f, 1500, 2.3f + 0.9f * lv);
+            nextWaveAt = now + (long) (1150 - 500 * lv);
+        }
+        boolean any = false;                                           // finished rings free their slot
+        for (int i = 0; i < MAX_WAVES; i++) {
+            if (waveDur[i] == 0) continue;
+            if (now - waveAt[i] >= waveDur[i]) waveDur[i] = 0;
+            else any = true;                                           // running, or queued to start
+        }
+        if (!any) return emitting;
+        c.save();
+        c.clipPath(bodyClip);
+        float base = g.knobR * knobScale;
+        for (int i = 0; i < MAX_WAVES; i++) {
+            if (waveDur[i] == 0) continue;
+            float t = (now - waveAt[i]) / (float) waveDur[i];
+            if (t < 0 || t >= 1f) continue;
+            float u = 1 - t;
+            float e = 1 - u * u * u;                                   // fast out, slow settle
+            float rad = base + (g.knobR * waveReach[i] - base) * e;
+            int a = (int) (255 * waveAlpha[i] * u * u);
+            if (a <= 0) continue;
+            line.setStrokeWidth(Math.max(0.5f * dp, waveWidth[i] * (1 - 0.7f * t)));
+            line.setColor(Color.argb(a, 255, 255, 255));
+            c.drawCircle(g.knobCx, g.knobRestY, rad, line);
+        }
+        c.restore();
+        return true;
+    }
+
+    /** Dips the knob when pressed and springs it back with a little bounce when let go. */
+    private void dipKnob(boolean down) {
+        if (dipAnim != null) {
+            dipAnim.cancel();
+            dipAnim = null;
+        }
+        float to = down ? 0.86f : 1f;
+        if (!sized || !motionOn()) {
+            knobScale = 1f;
+            invalidate();
+            return;
+        }
+        if (knobScale == to) return;
+        ValueAnimator a = ValueAnimator.ofFloat(knobScale, to);
+        a.setDuration(down ? 120 : 450);
+        a.setInterpolator(down ? new DecelerateInterpolator() : new OvershootInterpolator(3f));
+        a.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+            @Override public void onAnimationUpdate(ValueAnimator v) {
+                knobScale = (Float) v.getAnimatedValue();
+                invalidate();
+            }
+        });
+        dipAnim = a;
+        a.start();
     }
 
     /** Remembers the last few fitted strings so animation frames never re-measure text. */
@@ -971,40 +1185,54 @@ final class RadioView extends View {
 
     @Override public boolean onTouchEvent(MotionEvent e) {
         if (!sized) return false;
-        float x = e.getX(), y = e.getY();
+        float x = e.getX() / fit, y = e.getY() / fit;   // into layout coordinates (fit is 1 normally)
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN: {
                 pressed = hit(x, y);
                 if (pressed == R_STRIP) {
-                    int i = chipAt(x);
+                    cancelStripAnim();                              // the finger takes over the row
+                    boolean caught = !glide.isFinished();           // touched to stop a glide
+                    glide.forceFinished(true);
+                    if (swipe != null) swipe.recycle();
+                    swipe = VelocityTracker.obtain();
+                    swipe.addMovement(e);
+                    // Stopping a glide is never a hold-to-talk: catching the row must not start a call.
+                    int i = caught ? -1 : chipAt(x);
                     pressedChip = i;
-                    pressedPeer = i >= 1 ? chipId[i] : 0;
+                    pressedPeer = i >= 0 ? chipId[i] : 0;
                     stripScrolling = false;
                     stripDownX = x;
                     stripDownScroll = stripScroll;
                     directStarted = false;
-                    if (pressedChip >= 1) postDelayed(holdToTalk, 90);
+                    if (pressedChip >= 0) postDelayed(holdToTalk, 90);
                     invalidate();
                     return true;
                 }
                 if (pressed == R_KNOB && !locked) {
                     if (host.beginTalk(0)) {
+                        awayWhileTalking = false;
+                        slid = false;
                         dragging = true;
                         armed = false;
                         downY = y;
                         cancelKnobAnim();
                         downOffset = knobOffset;
+                        dipKnob(true);
+                        splash();
                         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
                     } else {
                         pressed = R_NONE;
                         shake();
                     }
+                } else if (pressed == R_KNOB) {
+                    dipKnob(true);                                  // locked: the tap that stops talking
                 }
                 invalidate();
                 return true;
             }
             case MotionEvent.ACTION_MOVE: {
                 if (pressed == R_STRIP) {
+                    if (swipe != null) swipe.addMovement(e);
                     if (directTo != 0) return true;                 // talking: ignore finger drift
                     if (!stripScrolling && Math.abs(x - stripDownX) > 8 * dp) {
                         stripScrolling = true;                      // it's a swipe, not a hold
@@ -1018,6 +1246,7 @@ final class RadioView extends View {
                 }
                 if (dragging) {
                     float travel = g.knobRestY - g.knobTopY;
+                    if (!slid && downY - y > 10 * dp) slid = true;  // sliding up: the waves stop
                     knobOffset = Math.max(0, Math.min(travel, downOffset + (downY - y)));
                     boolean a = knobOffset >= travel * 0.8f;
                     if (a != armed) {
@@ -1026,6 +1255,7 @@ final class RadioView extends View {
                     }
                     invalidate();
                 } else if (pressed != R_NONE && hit(x, y) != pressed) {
+                    if (pressed == R_KNOB) dipKnob(false);          // slid off: no tap after all
                     pressed = R_NONE;
                     invalidate();
                 }
@@ -1040,11 +1270,21 @@ final class RadioView extends View {
                         directTo = 0;
                         host.endTalk();
                         performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY_RELEASE);
-                    } else if (up && !stripScrolling && pressedChip == 0) {
-                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-                        host.editName();
-                    } else if (up && !stripScrolling && pressedChip >= 1 && !directStarted) {
+                    } else if (up && !stripScrolling && pressedChip >= 0 && !directStarted) {
                         engine.flash("Hold " + chipNameOf(pressedPeer) + " to talk to them only");
+                    } else if (up && stripScrolling && swipe != null && stripMax > 0 && motionOn()) {
+                        swipe.addMovement(e);
+                        swipe.computeCurrentVelocity(1000, maxGlide);
+                        float vx = swipe.getXVelocity() / fit;      // into layout units, like the touch
+                        if (Math.abs(vx) * fit > minGlide) {
+                            glide.fling(Math.round(stripScroll), 0, Math.round(-vx), 0,
+                                    0, Math.round(stripMax), 0, 0);
+                            postInvalidateOnAnimation();
+                        }
+                    }
+                    if (swipe != null) {
+                        swipe.recycle();
+                        swipe = null;
                     }
                     pressedChip = -1;
                     stripScrolling = false;
@@ -1054,17 +1294,20 @@ final class RadioView extends View {
                 }
                 if (dragging) {
                     dragging = false;
+                    dipKnob(false);
                     if (armed && up && engine.transmitting) {
-                        locked = true;
+                        locked = true;                              // locked talking has no waves
                         animateKnob(g.knobRestY - g.knobTopY);
                         performHapticFeedback(HapticFeedbackConstants.CONFIRM);
                     } else {
                         armed = false;
                         host.endTalk();
                         animateKnob(0);
+                        if (!slid) releaseWave();                   // a press let go in place
                         performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY_RELEASE);
                     }
                 } else if (pressed == R_KNOB && locked) {
+                    dipKnob(false);
                     if (up && hit(x, y) == R_KNOB) {
                         locked = false;
                         armed = false;
@@ -1088,6 +1331,7 @@ final class RadioView extends View {
     private void click(int region) {
         switch (region) {
             case R_POWER: host.togglePower(); break;
+            case R_NAME: host.editName(); break;
             case R_CH_DOWN: host.stepChannel(-1); break;
             case R_CH_UP: host.stepChannel(1); break;
             case R_SOUNDS: host.toggleSounds(); break;
@@ -1103,6 +1347,8 @@ final class RadioView extends View {
         if (dist(x, y, g.knobCx, ky) <= g.knobR + slop) return R_KNOB;
         if (dist(x, y, g.chDownCx, g.rowCy) <= g.btnR + slop / 2) return R_CH_DOWN;
         if (dist(x, y, g.chUpCx, g.rowCy) <= g.btnR + slop / 2) return R_CH_UP;
+        if (x >= plateL - slop / 2 && x <= plateR + slop / 2
+                && y >= g.nameT - slop / 2 && y <= g.nameB + slop / 2) return R_NAME;
         if (x >= g.stripL && x <= g.stripR && y >= g.stripT && y <= g.stripB) return R_STRIP;
         if (inToggle(x, y, g.soundsCx)) return R_SOUNDS;
         if (inToggle(x, y, g.bgCx)) return R_BG;
@@ -1123,10 +1369,20 @@ final class RadioView extends View {
     @Override protected void onWindowVisibilityChanged(int visibility) {
         super.onWindowVisibilityChanged(visibility);
         if (visibility != VISIBLE) {
+            if (locked || dragging) awayWhileTalking = true;
             removeCallbacks(holdToTalk);
+            glide.forceFinished(true);
+            if (swipe != null) {
+                swipe.recycle();
+                swipe = null;
+            }
             pressedChip = -1;
             pressed = R_NONE;
             dragging = false;
+            if (dipAnim != null) dipAnim.cancel();
+            dipAnim = null;
+            knobScale = 1f;
+            clearWaves();
         }
     }
 

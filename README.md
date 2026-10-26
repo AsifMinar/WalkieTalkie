@@ -36,7 +36,7 @@ A push-to-talk walkie-talkie for Android that works over local Wi-Fi. No interne
 | Talk without holding | Hold the talk button and slide up to lock; tap to stop |
 | Change channel | Tap the **−** / **+** buttons |
 | Talk to one person only | Hold their name in the people row |
-| Change your name | Tap your own name (**You**) in the people row |
+| Change your name | Tap your name between the **−** and **+** buttons |
 | Keep listening in the background | Turn on **Always on** |
 | Mute radio sounds | Turn off **Sounds** |
 
@@ -142,5 +142,5 @@ src/com/walkietalkie/wifi/
   AudioOut.java         Speaker output
   Sfx.java              Synthesized radio sounds
   Prefs.java            Saved settings
-tests/                  Desktop tests (security, trust rules, network simulation)
+tests/                  Desktop tests (security, trust rules, network simulation, screen layout)
 ```

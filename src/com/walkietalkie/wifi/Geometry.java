@@ -5,10 +5,23 @@ package com.walkietalkie.wifi;
  * checked on a desktop JVM across many screen sizes.
  *
  * Top to bottom inside the body: header (name + power button), speaker grille, display,
- * channel stepper, people row (one hold-to-talk button per person), slide-to-talk track with the
- * two side buttons, hint line.
+ * channel stepper with your name plate between - and +, people row (one hold-to-talk button per
+ * other person), slide-to-talk track with the two side buttons, hint line.
  */
 final class Geometry {
+
+    /**
+     * The smallest window the radio is laid out for. The layout itself needs 448dp of height and
+     * 300dp of width; these add a little margin. Smaller windows (split screen, pop-up windows)
+     * draw the radio at this size and scale it down evenly, so nothing overlaps or falls off.
+     */
+    static final float MIN_W_DP = 320, MIN_H_DP = 460;
+
+    /** 1 on every normal phone screen; below 1 only when the window is smaller than the minimum. */
+    static float fitScale(float w, float h, float dp) {
+        if (w <= 0 || h <= 0 || dp <= 0) return 1f;
+        return Math.min(1f, Math.min(w / (MIN_W_DP * dp), h / (MIN_H_DP * dp)));
+    }
 
     float w, h;
     float bodyL, bodyT, bodyR, bodyB, bodyRad;
@@ -24,7 +37,8 @@ final class Geometry {
     float infoL, infoR, titleSize, statusBaseline, subTop, subSize;
     int subMaxLines;
 
-    float rowT, rowB, rowCy, btnR, chDownCx, chUpCx, rowLabelSize;
+    float rowT, rowB, rowCy, btnR, chDownCx, chUpCx;
+    float nameMinL, nameMaxR, nameT, nameB, nameAvR;           // your name plate, between - and +
     float stripL, stripR, stripT, stripB, stripCy, chipH, chipNameSize, chipSubSize;
 
     float trL, trT, trR, trB, knobR, knobCx, knobRestY, knobTopY;
@@ -121,7 +135,13 @@ final class Geometry {
         btnR = 24 * dp;
         chDownCx = inL + btnR;
         chUpCx = inR - btnR;
-        rowLabelSize = 14 * dp * ts;
+        // The plate is centred between the buttons and may grow up to these edges; the gap keeps a
+        // tap on the plate from landing on a channel button (their touch area reaches 4dp out).
+        nameMinL = chDownCx + btnR + 10 * dp;
+        nameMaxR = chUpCx - btnR - 10 * dp;
+        nameT = rowCy - 20 * dp;
+        nameB = rowCy + 20 * dp;
+        nameAvR = 15 * dp;
         y = rowB + gRow;
 
         stripL = inL;
